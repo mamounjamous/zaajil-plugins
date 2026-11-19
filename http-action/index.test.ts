@@ -1,0 +1,790 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import HttpAction, { handleMessage, type HandleDeps } from './index.ts';
+import { readConfig } from './config.ts';
+import { hasSeen, shardOf, DEDUP_SHARDS, DEDUP_TTL_MS, type StorageLike } from './reliability.ts';
+import type { IncomingMessage, HookHandler } from '../types/zaajil';
+
+function cfgWith(over: Record<string, unknown> = {}) {
+  return readConfig({
+    baseUrl: 'https://api.example.com',
+    actions: JSON.stringify([{
+      id: 'check', match: { type: 'prefix', value: 'cek ' },
+      request: { method: 'GET', path: '/orders/{{args.0}}' },
+      replyTemplate: 'Status: {{response.status}}',
+      notFoundTemplate: 'NF',
+      errorTemplate: 'ERR',
+    }]),
+    ...over,
+  });
+}
+
+function fakeStore(): StorageLike & { m: Map<string, unknown> } {
+  const m = new Map<string, unknown>();
+  return {
+    m,
+    get: async <T>(k: string): Promise<T | null> => (m.has(k) ? (m.get(k) as T) : null),
+    set: async (k: string, v: unknown) => { m.set(k, v); },
+    delete: async (k: string) => { m.delete(k); },
+    list: async (prefix?: string) => [...m.keys()].filter((k) => (prefix ? k.startsWith(prefix) : true)),
+  };
+}
+
+const msg = (body: string, id = 'm1', type = 'text'): IncomingMessage => ({
+  id, from: '62@s.whatsapp.net', to: 'bot', chatId: 'c1',
+  body, type, timestamp: 0, fromMe: false, isGroup: false,
+}) as IncomingMessage;
+
+// Minimal PluginContext-shaped ctx for the priority/claim tests below — the file's other tests exercise
+// handleMessage directly via HandleDeps, so this is the only place onEnable itself needs to run.
+function makeCtx(overrides: {
+  config?: Record<string, unknown>;
+  registerHook?: (event: string, handler: HookHandler, priority?: number) => void;
+} = {}) {
+  return {
+    config: overrides.config ?? {
+      baseUrl: 'https://api.example.com',
+      actions: JSON.stringify([{
+        id: 'stock', match: { type: 'prefix', value: '/stock' },
+        request: { method: 'GET', path: '/stock/{{args.0}}' },
+        replyTemplate: 'Stock: {{response.status}}',
+      }]),
+    },
+    logger: { log() {}, debug() {}, warn() {}, error() {} },
+    storage: fakeStore(),
+    net: { fetch: async () => ({ ok: true, status: 200, statusText: 'OK', headers: {}, body: '{}' }) },
+    conversations: { send: async () => {} },
+    registerHook: overrides.registerHook ?? (() => {}),
+  };
+}
+
+// Enables a fresh HttpAction (one '/stock' action) and fires one message:received with `body`, returning
+// the synchronous {continue} result. The floated handleMessage call is out of scope — never awaited here.
+async function runHook(body: string, type = 'text') {
+  let handler: HookHandler | undefined;
+  const ctx = makeCtx({ registerHook: (_e, h) => { handler = h; } });
+  await new HttpAction().onEnable(ctx as never);
+  return handler!({
+    event: 'message:received', source: 'Engine', sessionId: 's1', timestamp: new Date(),
+    data: msg(body, 'm1', type),
+  });
+}
+
+// From host 0.23.2 a poll arrives with its question as the body and a contact card with its vCard, so a
+// non-empty body no longer means someone typed a command. This plugin performs real writes against the
+// operator's backend, which makes an accidental trigger the most expensive one in the catalog.
+test('a poll or a contact card never triggers an action', async () => {
+  assert.equal((await runHook('/stock ABC')).continue, false,
+    'guard rail: typed as text this body DOES trigger the action and claim the message');
+  assert.equal((await runHook('/stock ABC', 'poll')).continue, true,
+    'a poll titled with a configured prefix must not fire a request');
+  assert.equal((await runHook('/stock ABC', 'contact')).continue, true,
+    'nor may a contact card');
+  assert.equal((await runHook('/stock ABC', 'unknown')).continue, false,
+    'a tapped business button is a legitimate way to invoke an action');
+});
+
+// From host 0.23.5 a Baileys catalog order arrives as 'order' with the order note (else its title) as the
+// body, and a shared product card as 'product' with its text (else the product title). Neither is a typed
+// command, so a note or title starting with a configured prefix must not fire a request or claim it.
+for (const type of ['order', 'product']) {
+  test(`an inbound ${type} never triggers an action`, async () => {
+    assert.equal((await runHook('/stock ABC', type)).continue, true,
+      `a ${type} whose body starts with a configured prefix must not fire a request`);
+  });
+}
+
+test('a channel or broadcast post never triggers an action', async () => {
+  // A WhatsApp Channel post arrives with isGroup false, so the only chat-scope gate this plugin had
+  // read it as an ordinary 1:1 chat. This plugin performs real writes against the operator's backend,
+  // so a followed channel whose post happens to start with a configured prefix fired an irreversible
+  // request on behalf of a sender the operator has no relationship with.
+  let handler: HookHandler | undefined;
+  const ctx = makeCtx({ registerHook: (_e, h) => { handler = h; } });
+  await new HttpAction().onEnable(ctx as never);
+  const fire = (chatId: string) =>
+    handler!({
+      event: 'message:received', source: 'Engine', sessionId: 's1', timestamp: new Date(),
+      data: { ...msg('/stock ABC', 'm1', 'text'), chatId, from: chatId },
+    });
+
+  for (const chatId of ['120363000000000000@newsletter', '628123-456@broadcast', 'status@broadcast']) {
+    assert.equal((await fire(chatId)).continue, true, `${chatId} must not be claimed or acted on`);
+  }
+  // Guard rail: the same body in a real chat still triggers, so the test above proves the gate and
+  // not a broken fixture.
+  assert.equal((await fire('628123456789@c.us')).continue, false);
+});
+
+test('a whitespace-only body is ignored', async () => {
+  assert.equal((await runHook('   ')).continue, true);
+});
+
+// ── Co-installation: claim + priority (PLUGIN-STANDARD.md) ─────────────────────────────────────────
+
+test('registers first among responders', async () => {
+  let priority: number | undefined;
+  const ctx = makeCtx({ registerHook: (_e, _h, p) => { priority = p; } });
+  await new HttpAction().onEnable(ctx as never);
+  assert.equal(priority, 70);
+});
+
+test('claims a message that matches a configured command, passes anything else on', async () => {
+  const matched = await runHook('/stock ABC');
+  assert.equal(matched.continue, false, 'the command is addressed to this plugin');
+
+  const other = await runHook('good morning');
+  assert.equal(other.continue, true, 'no command matched — let another bot answer');
+});
+
+interface Opts { body?: string; status?: number; ok?: boolean; reject?: boolean; now?: () => number }
+
+function makeDeps(o: Opts = {}) {
+  const sendCalls: { env: unknown }[] = [];
+  const errors: unknown[] = [];
+  const warns: string[] = [];
+  const d: HandleDeps = {
+    cfg: cfgWith(),
+    storage: fakeStore(),
+    cooldown: new Map<string, number>(),
+    now: o.now ?? (() => 1000),
+    fetch: async () => {
+      if (o.reject) throw new Error('network');
+      return { ok: o.ok ?? true, status: o.status ?? 200, statusText: 'OK', headers: {}, body: o.body ?? '{}' };
+    },
+    conversations: { send: async (env: unknown) => { sendCalls.push({ env }); } },
+    logger: { log() {}, warn: (m: string) => void warns.push(m), error: (m: string, e?: unknown) => errors.push([m, e]) },
+  };
+  return { d, sendCalls, errors, warns };
+}
+
+test('2xx: renders the reply template from the JSON response and sends it quoting the inbound', async () => {
+  const { d, sendCalls } = makeDeps({ body: JSON.stringify({ status: 'shipped' }) });
+  await handleMessage(d, 's1', msg('cek INV-001'));
+  assert.equal(sendCalls.length, 1);
+  assert.deepEqual(sendCalls[0].env, {
+    sessionId: 's1', chatId: 'c1', type: 'text', text: 'Status: shipped', replyTo: 'm1',
+  });
+});
+
+test('404: sends the notFoundTemplate', async () => {
+  const { d, sendCalls } = makeDeps({ ok: false, status: 404, body: '{}' });
+  await handleMessage(d, 's1', msg('cek X'));
+  assert.equal((sendCalls[0].env as { text: string }).text, 'NF');
+});
+
+test('500: sends the errorTemplate', async () => {
+  const { d, sendCalls } = makeDeps({ ok: false, status: 500, body: '{}' });
+  await handleMessage(d, 's1', msg('cek X'));
+  assert.equal((sendCalls[0].env as { text: string }).text, 'ERR');
+});
+
+test('fetch failure: sends the errorTemplate and logs an error', async () => {
+  const { d, sendCalls, errors } = makeDeps({ reject: true });
+  await handleMessage(d, 's1', msg('cek X'));
+  assert.equal((sendCalls[0].env as { text: string }).text, 'ERR');
+  assert.ok(errors.length >= 1); // routed through logger.error (not warn) so the Error context is kept
+});
+
+test('no trigger match: nothing is sent (silent)', async () => {
+  const { d, sendCalls } = makeDeps({ body: '{}' });
+  await handleMessage(d, 's1', msg('hello world'));
+  assert.equal(sendCalls.length, 0);
+});
+
+test('a reply over the cap is truncated', async () => {
+  const cfg = readConfig({
+    baseUrl: 'https://api.example.com',
+    actions: JSON.stringify([{
+      id: 'check', match: { type: 'prefix', value: 'cek ' },
+      request: { method: 'GET', path: '/x' }, replyTemplate: '{{response}}',
+    }]),
+  });
+  const sendCalls: { env: unknown }[] = [];
+  await handleMessage({
+    cfg, storage: fakeStore(), cooldown: new Map(), now: () => 1000,
+    fetch: async () => ({ ok: true, status: 200, statusText: 'OK', headers: {}, body: JSON.stringify('x'.repeat(6000)) }),
+    conversations: { send: async (env: unknown) => { sendCalls.push({ env }); } },
+    logger: { log() {}, warn() {}, error() {} },
+  }, 's1', msg('cek X'));
+  const text = (sendCalls[0].env as { text: string }).text;
+  assert.ok(text.length <= 4000, `expected <= 4000, got ${text.length}`);
+  assert.ok(text.endsWith('…'));
+});
+
+test('missing notFoundTemplate falls back to a generic default', async () => {
+  const cfg = readConfig({
+    baseUrl: 'https://api.example.com',
+    actions: JSON.stringify([{
+      id: 'check', match: { type: 'prefix', value: 'cek ' },
+      request: { method: 'GET', path: '/x' }, replyTemplate: 'ok {{response.status}}',
+    }]),
+  });
+  const sendCalls: { env: unknown }[] = [];
+  await handleMessage({
+    cfg, storage: fakeStore(), cooldown: new Map(), now: () => 1000,
+    fetch: async () => ({ ok: false, status: 404, statusText: 'NF', headers: {}, body: '{}' }),
+    conversations: { send: async (env: unknown) => { sendCalls.push({ env }); } },
+    logger: { log() {}, warn() {}, error() {} },
+  }, 's1', msg('cek X'));
+  const text = (sendCalls[0].env as { text: string }).text;
+  assert.ok(!text.includes('{{'), 'default notFound should have no unresolved placeholder');
+  assert.ok(text.length > 0);
+});
+
+// ---- #8 reliability gates ----
+
+test('dedup: a redelivered message id is not processed twice', async () => {
+  const { d, sendCalls } = makeDeps({ body: JSON.stringify({ status: 'shipped' }) });
+  await handleMessage(d, 's1', msg('cek X', 'm1'));
+  await handleMessage(d, 's1', msg('cek X', 'm1')); // same id → redelivery
+  assert.equal(sendCalls.length, 1);
+});
+
+test('cooldown: a second message from the same chat within the window is dropped', async () => {
+  const { d, sendCalls } = makeDeps({ body: '{}' });
+  await handleMessage(d, 's1', msg('cek X', 'm1')); // different id below, same chat
+  await handleMessage(d, 's1', msg('cek X', 'm2'));
+  assert.equal(sendCalls.length, 1); // dedup passes (distinct ids), cooldown blocks
+});
+
+test('cooldown: a message after the window is allowed', async () => {
+  let now = 1000;
+  const { d, sendCalls } = makeDeps({ body: '{}', now: () => now });
+  await handleMessage(d, 's1', msg('cek X', 'm1'));
+  now += cfgWith().cooldownSeconds * 1000 + 1; // past the 3s window
+  await handleMessage(d, 's1', msg('cek X', 'm2'));
+  assert.equal(sendCalls.length, 2);
+});
+
+test('dedup fail-closed: a storage error drops the message (no reply, no double-fire risk)', async () => {
+  const sendCalls: { env: unknown }[] = [];
+  const broken = {
+    get: async () => { throw new Error('storage down'); },
+    set: async () => {}, delete: async () => {}, list: async () => [] as string[],
+  };
+  await handleMessage({
+    cfg: cfgWith(), storage: broken, cooldown: new Map(), now: () => 1000,
+    fetch: async () => ({ ok: true, status: 200, statusText: 'OK', headers: {}, body: '{}' }),
+    conversations: { send: async (env: unknown) => { sendCalls.push({ env }); } },
+    logger: { log() {}, warn() {}, error() {} },
+  }, 's1', msg('cek X', 'm1'));
+  assert.equal(sendCalls.length, 0); // dropped, not processed
+});
+
+test('send failure leaves the message un-marked: a redelivery after the cooldown window retries', async () => {
+  let now = 1000;
+  let sendAttempts = 0;
+  const sendCalls: { env: unknown }[] = [];
+  const send = async (env: unknown): Promise<void> => {
+    sendAttempts++;
+    if (sendAttempts === 1) throw new Error('transient WA failure');
+    sendCalls.push({ env });
+  };
+  const storage = fakeStore();
+  const d: HandleDeps = {
+    cfg: cfgWith(), storage, cooldown: new Map(), now: () => now,
+    fetch: async () => ({ ok: true, status: 200, statusText: 'OK', headers: {}, body: JSON.stringify({ status: 'ok' }) }),
+    conversations: { send }, logger: { log() {}, warn() {}, error() {} },
+  };
+  await handleMessage(d, 's1', msg('cek X', 'm1')).catch(() => {}); // send rejects → no mark
+  assert.equal(sendCalls.length, 0); // first send failed → no reply
+  assert.equal(await hasSeen(storage, 's1', 'm1'), false); // un-marked → redelivery can retry
+  now += cfgWith().cooldownSeconds * 1000 + 1; // past the cooldown window
+  await handleMessage(d, 's1', msg('cek X', 'm1')); // redelivery retries
+  assert.equal(sendCalls.length, 1); // retried send succeeded
+  assert.equal(await hasSeen(storage, 's1', 'm1'), true); // marked only after the successful send
+});
+
+// ---- sentinel (DoD §7): the auth token is used in the header but never reaches logs or the reply ----
+test('sentinel: the auth token is sent in the header yet never appears in logs or the reply', async () => {
+  const SECRET = 'SENTINEL-do-not-leak-9f3k2';
+  const logged: unknown[] = [];
+  const sendCalls: { env: unknown }[] = [];
+  let capturedHeaders: Record<string, string> | undefined;
+  const cfg = cfgWith({ authType: 'bearer', authToken: SECRET });
+  const d: HandleDeps = {
+    cfg, storage: fakeStore(), cooldown: new Map(), now: () => 1000,
+    fetch: async (_u, init) => { capturedHeaders = init?.headers; throw new Error('upstream failure'); },
+    conversations: { send: async (env: unknown) => { sendCalls.push({ env }); } },
+    logger: {
+      log: (m: string) => logged.push(m),
+      warn: (m: string, e?: unknown) => logged.push([m, e]),
+      error: (m: string, e?: unknown) => logged.push([m, e]),
+    },
+  };
+  await handleMessage(d, 's1', msg('cek X'));
+  assert.ok(capturedHeaders?.Authorization?.includes(SECRET), 'sanity: secret is in the request header (used, not absent)');
+  const haystack = `${JSON.stringify(logged)}${JSON.stringify(sendCalls)}`;
+  assert.ok(!haystack.includes(SECRET), 'auth token must never appear in logs or the reply');
+});
+
+// ── Sender resolution (0.1.2) ───────────────────────────────────────────────────────────────────────
+
+test('{{sender.phone}} resolves from the JID — the host never sets senderPhone before the hook runs', async () => {
+  const { d, sendCalls } = makeDeps({ body: JSON.stringify({ status: 'ok' }) });
+  d.cfg = cfgWith({
+    actions: JSON.stringify([{
+      id: 'me', match: { type: 'prefix', value: 'me' },
+      request: { method: 'GET', path: '/c/{{sender.phone}}' },
+      replyTemplate: 'phone={{sender.phone}} id={{sender.id}}',
+    }]),
+  });
+  await handleMessage(d, 's1', { ...msg('me'), from: '6281234567890@c.us' } as IncomingMessage);
+  assert.equal((sendCalls[0].env as { text: string }).text, 'phone=6281234567890 id=6281234567890@c.us');
+});
+
+test('in a group, sender.id is the AUTHOR — not the group everyone shares', async () => {
+  const { d, sendCalls } = makeDeps({ body: JSON.stringify({ status: 'ok' }) });
+  d.cfg = cfgWith({
+    respondInGroups: true,
+    actions: JSON.stringify([{
+      id: 'me', match: { type: 'prefix', value: 'me' },
+      request: { method: 'GET', path: '/c/{{sender.id}}' },
+      replyTemplate: 'id={{sender.id}} phone={{sender.phone}}',
+    }]),
+  });
+  const grp = { ...msg('me'), isGroup: true, from: '120363@g.us', chatId: '120363@g.us', author: '6281234567890@c.us' };
+  await handleMessage(d, 's1', grp as IncomingMessage);
+  assert.equal((sendCalls[0].env as { text: string }).text, 'id=6281234567890@c.us phone=6281234567890');
+});
+
+test('a @lid sender yields no phone — a LID user part is not a real number', async () => {
+  const { d, sendCalls } = makeDeps({ body: JSON.stringify({ status: 'ok' }) });
+  d.cfg = cfgWith({
+    actions: JSON.stringify([{
+      id: 'me', match: { type: 'prefix', value: 'me' },
+      request: { method: 'GET', path: '/c/x' },
+      replyTemplate: 'phone=[{{sender.phone}}]',
+    }]),
+  });
+  await handleMessage(d, 's1', { ...msg('me'), from: '118367890123478@lid' } as IncomingMessage);
+  assert.equal((sendCalls[0].env as { text: string }).text, 'phone=[]');
+});
+
+// ── Silent-drop and empty-reply guards (0.1.2) ──────────────────────────────────────────────────────
+
+test('a dedup read failure is logged instead of dropping the command without a trace', async () => {
+  const { d, sendCalls, warns } = makeDeps({});
+  d.storage = { ...d.storage, get: async () => { throw new Error('quota'); } };
+  await handleMessage(d, 's1', msg('cek INV-001'));
+  assert.equal(sendCalls.length, 0, 'still fail-closed — no reply');
+  assert.ok(warns.some((w) => w.includes('dedup read failed')), `expected a warning, got ${JSON.stringify(warns)}`);
+});
+
+test('a template referencing a missing field sends the error template, never an empty bubble', async () => {
+  const { d, sendCalls, warns } = makeDeps({ body: JSON.stringify({ other: 1 }) });
+  d.cfg = cfgWith({
+    actions: JSON.stringify([{
+      id: 'gone', match: { type: 'prefix', value: 'cek ' },
+      request: { method: 'GET', path: '/o/{{args.0}}' },
+      replyTemplate: '{{response.missing}}', // renders to ''
+      errorTemplate: 'Sorry, could not read that.',
+    }]),
+  });
+  await handleMessage(d, 's1', msg('cek INV-001'));
+  assert.equal((sendCalls[0].env as { text: string }).text, 'Sorry, could not read that.');
+  assert.ok(warns.some((w) => w.includes('empty reply')));
+});
+
+test('an empty reply with an empty error template still sends something', async () => {
+  const { d, sendCalls } = makeDeps({ body: JSON.stringify({ other: 1 }) });
+  d.cfg = cfgWith({
+    actions: JSON.stringify([{
+      id: 'gone', match: { type: 'prefix', value: 'cek ' },
+      request: { method: 'GET', path: '/o/{{args.0}}' },
+      replyTemplate: '{{response.missing}}',
+      errorTemplate: '{{response.alsoMissing}}',
+    }]),
+  });
+  await handleMessage(d, 's1', msg('cek INV-001'));
+  assert.ok((sendCalls[0].env as { text: string }).text.trim().length > 0);
+});
+
+// Regression: phoneFromJid originally denylisted only '@lid'. A group, channel or broadcast JID also
+// has a numeric local part, so those were emitted as if they were phone numbers — the exact failure the
+// helper exists to prevent, and worse than before the helper existed (the field used to be empty).
+test('a non-user JID never yields a phone number', async () => {
+  const cases: Array<[string, string]> = [
+    ['6281234567890@c.us', '6281234567890'],
+    ['6281234567890@s.whatsapp.net', '6281234567890'],
+    ['628123:12@s.whatsapp.net', '628123'],          // multi-device suffix stripped
+    ['118367890123478@lid', ''],                      // privacy id
+    ['120363144038483540@g.us', ''],                  // group
+    ['120363144038483540@newsletter', ''],            // channel
+    ['status@broadcast', ''],
+    ['nonsense', ''],
+  ];
+  for (const [from, want] of cases) {
+    const { d, sendCalls } = makeDeps({ body: JSON.stringify({ ok: 1 }) });
+    d.cfg = cfgWith({
+      actions: JSON.stringify([{
+        id: 'me', match: { type: 'prefix', value: 'me' },
+        request: { method: 'GET', path: '/c/x' }, replyTemplate: 'p=[{{sender.phone}}]',
+      }]),
+    });
+    await handleMessage(d, 's1', { ...msg('me'), from, author: undefined } as IncomingMessage);
+    assert.equal((sendCalls[0].env as { text: string }).text, `p=[${want}]`, `for ${from}`);
+  }
+});
+
+// ── Late delivery (0.2.10) ──────────────────────────────────────────────────────────────────────────
+// From Zaajil 0.23.6 a Baileys session delivers, after it reconnects, what WhatsApp queued while it was
+// disconnected, each message with its original send time. A POST is a write; running one the contact
+// sent long ago is worse than asking again. A GET only reads, so a late lookup still runs.
+
+const NOW = 1_800_000_000_000; // ms
+const LATE = 'This command arrived late and was not run. Please send it again if you still need it.';
+const secsAgo = (s: number) => NOW / 1000 - s;
+
+function postDeps(o: Opts = {}) {
+  const r = makeDeps({ body: JSON.stringify({ id: 'T-1', status: 'shipped' }), now: () => NOW, ...o });
+  r.d.cfg = cfgWith({
+    actions: JSON.stringify([{
+      id: 'create', match: { type: 'prefix', value: 'buat ' },
+      request: { method: 'POST', path: '/tickets', bodyTemplate: '{"d":"{{args.0}}"}' },
+      replyTemplate: 'Ticket {{response.id}}',
+    }, {
+      id: 'check', match: { type: 'prefix', value: 'cek ' },
+      request: { method: 'GET', path: '/orders/{{args.0}}' },
+      replyTemplate: 'Status: {{response.status}}',
+    }]),
+  });
+  const fetched: string[] = [];
+  const inner = r.d.fetch;
+  r.d.fetch = async (url, init) => { fetched.push(`${init?.method} ${url}`); return inner(url, init); };
+  return { ...r, fetched };
+}
+const at = (body: string, ts: number, id = 'm1') => ({ ...msg(body, id), timestamp: ts }) as IncomingMessage;
+
+test('a POST older than five minutes is not run; the contact is asked to send it again, once', async () => {
+  const { d, sendCalls, fetched, warns } = postDeps();
+  await handleMessage(d, 's1', at('buat X', secsAgo(301)));
+  assert.deepEqual(fetched, [], 'the backend write must not fire');
+  assert.match(warns.join('\n'), /'create' not run, the command arrived late/, 'a fast gateway clock shows in the log');
+  assert.deepEqual(sendCalls.map((c) => c.env), [
+    { sessionId: 's1', chatId: 'c1', type: 'text', text: LATE, replyTo: 'm1' },
+  ]);
+  assert.equal(await hasSeen(d.storage, 's1', 'm1'), true, 'marked after the notice is sent');
+  await handleMessage(d, 's1', at('buat X', secsAgo(400))); // redelivery of the same id
+  assert.equal(sendCalls.length, 1, 'a redelivery repeats neither the notice nor the request');
+  assert.deepEqual(fetched, []);
+});
+
+test('a late GET still runs: a lookup returns current data', async () => {
+  const { d, sendCalls, fetched } = postDeps();
+  await handleMessage(d, 's1', at('cek INV-1', secsAgo(3600)));
+  assert.deepEqual(fetched, ['GET https://api.example.com/orders/INV-1']);
+  assert.equal((sendCalls[0].env as { text: string }).text, 'Status: shipped');
+});
+
+test('a POST inside the window, or without a usable timestamp, still runs', async () => {
+  for (const ts of [secsAgo(300), secsAgo(0), NOW / 1000 + 120, 0, -5, NaN, Infinity, undefined]) {
+    const { d, sendCalls, fetched } = postDeps();
+    await handleMessage(d, 's1', at('buat X', ts as number));
+    assert.equal(fetched.length, 1, `timestamp ${ts} must count as fresh`);
+    assert.equal((sendCalls[0].env as { text: string }).text, 'Ticket T-1', `timestamp ${ts}`);
+  }
+});
+
+test('a refused late POST does not take the chat\'s cooldown slot', async () => {
+  const { d, sendCalls, fetched } = postDeps();
+  await handleMessage(d, 's1', at('buat X', secsAgo(600), 'm1')); // queued during the outage
+  await handleMessage(d, 's1', at('cek INV-1', secsAgo(1), 'm2')); // sent right after reconnect
+  assert.deepEqual(sendCalls.map((c) => (c.env as { text: string }).text), [LATE, 'Status: shipped']);
+  assert.deepEqual(fetched, ['GET https://api.example.com/orders/INV-1']);
+});
+
+test('a late notice that fails to send stays un-marked, and its redelivery never runs the request', async () => {
+  let attempts = 0;
+  const { d, sendCalls, fetched } = postDeps();
+  const send = d.conversations.send;
+  d.conversations = { send: async (env) => { if (++attempts === 1) throw new Error('transient'); return send(env); } };
+  await assert.rejects(handleMessage(d, 's1', at('buat X', secsAgo(600))), /transient/);
+  assert.deepEqual(fetched, [], 'the request must not fire before the notice');
+  assert.equal(await hasSeen(d.storage, 's1', 'm1'), false, 'un-marked, so a redelivery retries the notice');
+  await handleMessage(d, 's1', at('buat X', secsAgo(700)));
+  assert.equal((sendCalls[0].env as { text: string }).text, LATE);
+  assert.equal(await hasSeen(d.storage, 's1', 'm1'), true);
+  assert.deepEqual(fetched, [], 'the request never fires on either attempt');
+});
+
+test('a failed POST reply retries its persisted text without repeating the write or waiting for cooldown', async () => {
+  const { d, fetched, sendCalls } = postDeps();
+  const send = d.conversations.send;
+  d.conversations.send = async () => { throw new Error('WA offline'); };
+  await assert.rejects(handleMessage(d, 's1', msg('buat X')), /WA offline/);
+  assert.equal(await hasSeen(d.storage, 's1', 'm1'), false);
+  await handleMessage({ ...d, cooldown: new Map(), conversations: { send } }, 's1', msg('buat X'));
+  assert.equal(fetched.length, 1);
+  assert.deepEqual(sendCalls.map(c => (c.env as { text: string }).text), ['Ticket T-1']);
+  assert.equal(await hasSeen(d.storage, 's1', 'm1'), true);
+});
+
+test('concurrent copies of a command run only one POST with cooldown disabled', async () => {
+  const { d, fetched, sendCalls } = postDeps();
+  d.cfg.cooldownSeconds = 0;
+  await Promise.all([handleMessage(d, 's1', msg('buat X')), handleMessage(d, 's1', msg('buat X'))]);
+  assert.equal(fetched.length, 1);
+  assert.equal(sendCalls.length, 1);
+});
+
+test('POST intent storage failure prevents the backend write', async () => {
+  const { d, fetched, sendCalls, errors } = postDeps();
+  d.storage.set = async () => { throw new Error('quota'); };
+  await handleMessage(d, 's1', msg('buat X'));
+  assert.deepEqual(fetched, []);
+  assert.deepEqual(sendCalls, []);
+  assert.ok(errors.length > 0);
+});
+
+test('an unrecorded POST response leaves an unknown intent that cannot repeat the backend write', async () => {
+  const { d, fetched, sendCalls, errors } = postDeps();
+  const set = d.storage.set;
+  let writes = 0;
+  d.storage.set = async (key, value) => {
+    if (key.startsWith('dedupb:') && ++writes > 1) throw new Error('quota');
+    return set(key, value);
+  };
+  await handleMessage(d, 's1', msg('buat X'));
+  await handleMessage({ ...d, cooldown: new Map() }, 's1', msg('buat X'));
+  assert.equal(fetched.length, 1);
+  assert.ok(sendCalls.length > 0);
+  assert.ok(sendCalls.every(c => /could not be confirmed/.test((c.env as { text: string }).text)));
+  assert.ok(errors.length > 0);
+});
+
+test('a POST timeout is reported as uncertain and never rerun on redelivery', async () => {
+  const { d, fetched, sendCalls } = postDeps({ reject: true });
+  d.cfg.cooldownSeconds = 0;
+  await handleMessage(d, 's1', msg('buat X'));
+  await handleMessage(d, 's1', msg('buat X'));
+  assert.equal(fetched.length, 1);
+  assert.match((sendCalls[0].env as { text: string }).text, /could not be confirmed/);
+});
+
+test('stored POST replies cannot cross backend, credential, action or chat changes', async () => {
+  for (const change of ['baseUrl', 'authToken', 'action', 'chatId']) {
+    const { d, fetched, sendCalls } = postDeps();
+    const send = d.conversations.send;
+    d.conversations.send = async () => { throw new Error('WA offline'); };
+    await assert.rejects(handleMessage(d, 's1', msg('buat X')), /WA offline/);
+    const cfg = structuredClone(d.cfg);
+    if (change === 'baseUrl') cfg.baseUrl = 'https://new.example.com';
+    if (change === 'authToken') { cfg.authType = 'bearer'; cfg.authToken = 'new-private-token'; }
+    if (change === 'action') cfg.actions[0].request.path = '/new-tickets';
+    const incoming = { ...msg('buat X'), chatId: change === 'chatId' ? 'other-chat' : 'c1' };
+    await handleMessage({ ...d, cfg, cooldown: new Map(), conversations: { send } }, 's1', incoming);
+    assert.equal(fetched.length, 1, change);
+    assert.match((sendCalls[0].env as { text: string }).text, /could not be confirmed/, change);
+    assert.ok(!JSON.stringify([...((d.storage as ReturnType<typeof fakeStore>).m).values()]).includes('new-private-token'));
+  }
+});
+
+test('a failed GET reply still refreshes the lookup on redelivery', async () => {
+  const { d, fetched, sendCalls } = postDeps();
+  d.cfg.cooldownSeconds = 0;
+  const send = d.conversations.send;
+  d.conversations.send = async () => { throw new Error('WA offline'); };
+  await assert.rejects(handleMessage(d, 's1', msg('cek X')), /WA offline/);
+  d.conversations.send = send;
+  await handleMessage(d, 's1', msg('cek X'));
+  assert.equal(fetched.length, 2);
+  assert.equal(sendCalls.length, 1);
+});
+
+test('a completed POST waiting for delivery survives another marker in the same bucket', async () => {
+  const { d, fetched, sendCalls } = postDeps();
+  d.cfg.cooldownSeconds = 0;
+  const send = d.conversations.send;
+  d.conversations.send = async () => { throw new Error('WA offline'); };
+  await assert.rejects(handleMessage(d, 's1', msg('buat X')), /WA offline/);
+  let partner = '';
+  for (let i = 0; !partner; i++) if (shardOf(`s1:p${i}`) === shardOf('s1:m1')) partner = `p${i}`;
+  d.conversations.send = send;
+  await handleMessage(d, 's1', msg('cek X', partner));
+  await handleMessage(d, 's1', msg('buat X'));
+  assert.equal(fetched.filter(f => f.startsWith('POST')).length, 1);
+  assert.equal(sendCalls.length, 2);
+});
+
+test('expired pending replies are not replayed and legacy POST markers are still honored', async () => {
+  const { d, fetched, sendCalls } = postDeps();
+  const send = d.conversations.send;
+  d.conversations.send = async () => { throw new Error('WA offline'); };
+  await assert.rejects(handleMessage(d, 's1', msg('buat X')), /WA offline/);
+  d.conversations.send = send;
+  d.now = () => NOW + DEDUP_TTL_MS + 1;
+  await handleMessage(d, 's1', at('buat X', NOW / 1000));
+  assert.equal(fetched.length, 1);
+  assert.equal((sendCalls[0].env as { text: string }).text, LATE);
+  await d.storage.set('dedup:s1:legacy', { t: NOW });
+  await handleMessage(d, 's1', msg('buat X', 'legacy'));
+  assert.equal(fetched.length, 1);
+  assert.equal(sendCalls.length, 1);
+});
+
+test('failure to mark a delivered POST retains its completed reply for redelivery', async () => {
+  const { d, fetched, sendCalls } = postDeps();
+  const set = d.storage.set;
+  let writes = 0;
+  d.storage.set = async (key, value) => {
+    if (key.startsWith('dedupb:') && ++writes === 3) throw new Error('quota');
+    return set(key, value);
+  };
+  await handleMessage(d, 's1', msg('buat X'));
+  assert.equal(await hasSeen(d.storage, 's1', 'm1'), false);
+  await handleMessage(d, 's1', msg('buat X'));
+  assert.equal(fetched.length, 1);
+  assert.deepEqual(sendCalls.map(c => (c.env as { text: string }).text), ['Ticket T-1', 'Ticket T-1']);
+});
+
+test('a completion read failure after the marker check still prevents POST dispatch', async () => {
+  const { d, fetched, sendCalls, warns } = postDeps();
+  const get = d.storage.get;
+  let reads = 0;
+  d.storage.get = async <T>(key: string): Promise<T | null> => {
+    if (++reads === 3) throw new Error('storage unavailable');
+    return get<T>(key);
+  };
+  await handleMessage(d, 's1', msg('buat X'));
+  assert.deepEqual(fetched, []);
+  assert.deepEqual(sendCalls, []);
+  assert.ok(warns.some(w => w.includes('dedup read failed')));
+});
+
+test('one stalled POST does not block the same message ID in another session', async () => {
+  const { d, sendCalls } = postDeps();
+  let started!: () => void;
+  let release!: () => void;
+  const waiting = new Promise<void>(resolve => { started = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const fetch = d.fetch;
+  let calls = 0;
+  d.fetch = async (url, init) => {
+    if (++calls === 1) { started(); await gate; }
+    return fetch(url, init);
+  };
+  const first = handleMessage(d, 's1', msg('buat X'));
+  await waiting;
+  try {
+    await handleMessage(d, 's2', msg('buat X'));
+    assert.equal(sendCalls.length, 1);
+    assert.equal((sendCalls[0].env as { sessionId: string }).sessionId, 's2');
+  } finally {
+    release();
+    await first;
+  }
+  assert.equal(calls, 2);
+});
+
+test('pending POST replies use bounded bucket files and expire together on bucket writes', async () => {
+  const { d } = postDeps();
+  d.cfg.cooldownSeconds = 0;
+  d.conversations.send = async () => { throw new Error('WA offline'); };
+  for (let i = 0; i < 300; i++) await assert.rejects(handleMessage(d, 's1', msg('buat X', `pending${i}`)), /WA offline/);
+  const keys = await d.storage.list();
+  assert.ok(keys.length <= DEDUP_SHARDS + 1);
+  assert.ok(keys.every(k => k.startsWith('dedupb:') || k === 'dedup:__prune__'));
+  d.now = () => NOW + DEDUP_TTL_MS + 1;
+  let partner = '';
+  for (let i = 0; !partner; i++) if (shardOf(`s1:p${i}`) === shardOf('s1:pending0')) partner = `p${i}`;
+  d.conversations.send = async () => {};
+  await handleMessage(d, 's1', msg('buat X', partner));
+  const bucket = await d.storage.get<Record<string, unknown>>(`dedupb:s${shardOf('s1:pending0')}`);
+  assert.ok(!Object.hasOwn(bucket!, 's1:pending0'));
+  assert.ok(Object.hasOwn(bucket!, `s1:${partner}`));
+});
+
+test('forwarded messages and shared locations never trigger an action or claim the message', async () => {
+  const { d, fetched, sendCalls } = postDeps();
+  await handleMessage(d, 's1', { ...msg('buat X', 'fwd-1'), isForwarded: true });
+  await handleMessage(d, 's1', { ...msg('buat X', 'loc-1'), type: 'location' });
+  assert.deepEqual(fetched, []);
+  assert.deepEqual(sendCalls, []);
+
+  let handler!: (h: unknown) => Promise<{ continue: boolean }>;
+  const plugin = new HttpAction();
+  const ctx = {
+    config: {
+      baseUrl: 'https://api.example.com',
+      actions: JSON.stringify(d.cfg.actions),
+    },
+    logger: { log() {}, debug() {}, warn() {}, error() {} },
+    registerHook: (_e: string, h: (x: unknown) => Promise<{ continue: boolean }>) => { handler = h; },
+    net: { fetch: d.fetch },
+    conversations: d.conversations,
+    storage: d.storage,
+  };
+  await plugin.onEnable(ctx as never);
+
+  const fwdRes = await handler({
+    source: 'Engine',
+    sessionId: 's1',
+    data: { ...msg('buat X', 'fwd-2'), isForwarded: true },
+  });
+  const locRes = await handler({
+    source: 'Engine',
+    sessionId: 's1',
+    data: { ...msg('buat X', 'loc-2'), type: 'location' },
+  });
+  assert.deepEqual(fwdRes, { continue: true });
+  assert.deepEqual(locRes, { continue: true });
+  assert.deepEqual(fetched, []);
+});
+
+test('a pre-flight POST template/body error sends errorTemplate without saving an uncertain POST intent', async () => {
+  const { d, fetched, sendCalls } = postDeps();
+  d.cfg = cfgWith({
+    actions: JSON.stringify([{
+      id: 'create',
+      match: { type: 'prefix', value: 'buat ' },
+      request: { method: 'POST', path: '/tickets', headers: { 'X-Note': '{{message.id}}' }, bodyTemplate: '{"d":"{{args.0}}"}' },
+      replyTemplate: 'Ticket {{response.id}}',
+      errorTemplate: 'Bad command input.',
+    }]),
+  });
+  await handleMessage(d, 's1', msg('buat X', 'bad\nid'));
+  assert.deepEqual(fetched, [], 'fetch must never run when request building fails locally');
+  assert.equal((sendCalls[0].env as { text: string }).text, 'Bad command input.');
+  const keys = await d.storage.list('dedupb:');
+  for (const k of keys) {
+    const b = await d.storage.get<Record<string, unknown>>(k);
+    for (const v of Object.values(b ?? {})) {
+      assert.equal(typeof v, 'number', 'must mark seen as a plain timestamp, not an uncertain PostCompletion');
+    }
+  }
+});
+
+test('a POST accepted with HTTP 2xx whose reply cannot be shown records completion and asks the contact to confirm before retrying', async () => {
+  const notice = /could not be confirmed\. Please contact the operator before trying again\./;
+  const { d, fetched, sendCalls } = postDeps({ ok: true, status: 200, body: 'not-json' });
+  d.cfg.cooldownSeconds = 0;
+  d.cfg.actions[0].errorTemplate = 'Service unavailable, please try again later.';
+  const realSend = d.conversations.send;
+  let failFirstSend = true;
+  d.conversations.send = async (env) => {
+    if (failFirstSend) {
+      failFirstSend = false;
+      throw new Error('WA offline');
+    }
+    return realSend(env);
+  };
+  await assert.rejects(handleMessage(d, 's1', msg('buat X', 'm-nonjson')), /WA offline/);
+  await handleMessage(d, 's1', msg('buat X', 'm-nonjson'));
+  assert.equal(fetched.length, 1, 'completed HTTP 200 POST must not re-fire on redelivery');
+  assert.match((sendCalls[0].env as { text: string }).text, notice, 'a write that happened must not invite a retry');
+
+  const tpl = postDeps({ ok: true, status: 201, body: JSON.stringify({ id: 'T-9' }) });
+  tpl.d.cfg.actions[0].replyTemplate = '{{response.__proto__.x}}';
+  tpl.d.cfg.actions[0].errorTemplate = 'Template failed.';
+  await handleMessage(tpl.d, 's1', msg('buat X', 'm-tpl'));
+  assert.equal(tpl.fetched.length, 1);
+  assert.match((tpl.sendCalls[0].env as { text: string }).text, notice);
+
+  // A non-2xx answer is the upstream refusing the write, so errorTemplate stays the right reply.
+  const refused = postDeps({ ok: false, status: 500, body: 'x'.repeat(300 * 1024) });
+  refused.d.cfg.actions[0].errorTemplate = 'Upstream refused.';
+  await handleMessage(refused.d, 's1', msg('buat X', 'm-500'));
+  assert.equal((refused.sendCalls[0].env as { text: string }).text, 'Upstream refused.');
+});

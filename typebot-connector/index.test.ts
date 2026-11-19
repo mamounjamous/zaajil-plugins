@@ -1,0 +1,232 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import type { PluginContext, HookHandler, HookContext } from '../types/zaajil';
+import Plugin, { readConfig } from './index.ts';
+
+test('readConfig: defaults, normalization, and fail-fast', () => {
+  const c = readConfig({ publicId: 'bot', apiHost: 'https://typebot.io' });
+  assert.equal(c.apiHost, 'https://typebot.io');
+  assert.equal(c.respondInGroups, true);
+  assert.equal(c.sessionTimeoutMinutes, 30);
+  assert.equal(readConfig({ publicId: 'bot', apiHost: 'https://my.host/' }).apiHost, 'https://my.host');
+  assert.throws(() => readConfig({}), /publicId/);
+  assert.throws(() => readConfig({ publicId: 'bot' }), /apiHost is required/);
+  assert.throws(() => readConfig({ publicId: 'b', apiHost: 'http://x' }), /https/);
+  assert.throws(() => readConfig({ publicId: 'b', apiHost: 'https://u:p@x' }), /credentials/);
+  assert.throws(() => readConfig({ publicId: 'b', apiHost: 'https://typebot.io?foo=1' }), /query string or fragment/);
+  assert.throws(() => readConfig({ publicId: 'b', apiHost: 'https://typebot.io#frag' }), /query string or fragment/);
+  assert.doesNotThrow(() => readConfig({ publicId: 'b', apiHost: 'https://typebot.io', mediaHost: 'https://s3.example.com' }));
+  assert.throws(() => readConfig({ publicId: 'b', apiHost: 'https://typebot.io', mediaHost: 'not-a-url' }), /mediaHost must be a valid URL/);
+  assert.throws(() => readConfig({ publicId: 'b', apiHost: 'https://typebot.io', mediaHost: 'http://s3.example.com' }), /mediaHost must be an https URL/);
+  assert.throws(() => readConfig({ publicId: 'b', apiHost: 'https://typebot.io', mediaHost: 'https://u:p@s3.example.com' }), /mediaHost must be an https URL/);
+});
+
+test('onEnable registers a message:received hook that returns {continue:true}', async () => {
+  let registered: { event: string; handler: HookHandler; priority?: number } | undefined;
+  const ctx = {
+    config: { publicId: 'bot', apiHost: 'https://typebot.io' },
+    logger: { log() {}, debug() {}, warn() {}, error() {} },
+    storage: { get: async () => null, set: async () => {}, delete: async () => {}, list: async () => [] },
+    net: { fetch: async () => ({ ok: true, status: 200, headers: {}, body: '{}' }) },
+    conversations: { send: async () => {} },
+    registerHook: (event: string, handler: HookHandler, priority?: number) => void (registered = { event, handler, priority }),
+  } as unknown as PluginContext;
+
+  await new Plugin().onEnable(ctx);
+  assert.equal(registered?.event, 'message:received');
+  const result = await registered!.handler({ event: 'message:received', data: undefined, timestamp: new Date(), source: 'Engine' });
+  assert.deepEqual(result, { continue: true });
+});
+
+test('message:received hook resolves synchronously (claiming an in-scope chat) without awaiting a hanging Typebot turn', async () => {
+  let registered: { event: string; handler: HookHandler; priority?: number } | undefined;
+  const ctx = {
+    config: { publicId: 'bot', apiHost: 'https://typebot.io' },
+    logger: { log() {}, debug() {}, warn() {}, error() {} },
+    storage: { get: async () => null, set: async () => {}, delete: async () => {}, list: async () => [] },
+    net: { fetch: () => new Promise(() => {}) },
+    conversations: { send: async () => {} },
+    registerHook: (event: string, handler: HookHandler, priority?: number) => void (registered = { event, handler, priority }),
+  } as unknown as PluginContext;
+
+  await new Plugin().onEnable(ctx);
+  const populated = {
+    event: 'message:received',
+    sessionId: 'sess',
+    source: 'Engine',
+    timestamp: new Date(),
+    data: {
+      id: 'm', from: 'x', to: 'y', chatId: 'c@c.us', body: 'hi', type: 'chat',
+      timestamp: 0, fromMe: false, isGroup: false,
+    },
+  } as unknown as HookContext;
+  // In scope (real Engine message, not our own, has a chat) — claimed even though net.fetch never
+  // resolves, proving the claim is decided before the floated handleTurn call, not after it.
+  assert.deepEqual(await registered!.handler(populated), { continue: false });
+});
+
+test('a message delivered already deleted starts no Typebot turn and is not claimed', async () => {
+  let registered: { event: string; handler: HookHandler; priority?: number } | undefined;
+  const calls: string[] = [];
+  const ctx = {
+    config: { publicId: 'bot', apiHost: 'https://typebot.io' },
+    logger: { log() {}, debug() {}, warn() {}, error() {} },
+    storage: { get: async () => null, set: async () => {}, delete: async () => {}, list: async () => [] },
+    net: { fetch: async (url: string) => { calls.push(url); return { ok: true, status: 200, headers: {}, body: '{}' }; } },
+    conversations: { send: async () => {} },
+    registerHook: (event: string, handler: HookHandler, priority?: number) => void (registered = { event, handler, priority }),
+  } as unknown as PluginContext;
+  await new Plugin().onEnable(ctx);
+  const fire = (type: string, body: string) => registered!.handler({
+    event: 'message:received', sessionId: 'sess', source: 'Engine', timestamp: new Date(),
+    data: { id: `m-${type}`, from: 'x', to: 'y', chatId: 'c@c.us', body, type, timestamp: 0, fromMe: false, isGroup: false },
+  } as unknown as HookContext);
+
+  // Host 0.26.0 hands the hook an empty 'revoked' placeholder for it.
+  assert.deepEqual(await fire('revoked', ''), { continue: true });
+  await new Promise(r => setImmediate(r));
+  assert.deepEqual(calls, [], 'no call reaches Typebot for a deleted message');
+
+  // Guard rail: a real message from the same chat still claims and reaches Typebot.
+  assert.deepEqual(await fire('chat', 'hi'), { continue: false });
+  await new Promise(r => setImmediate(r));
+  assert.ok(calls.length > 0, 'the guard is on the type, not a broken fixture');
+});
+
+// ── Co-installation: claim + priority (PLUGIN-STANDARD.md) ─────────────────────────────────────────
+
+// Minimal ctx builder for the tests below — the two tests above build their own inline ctx per case (a
+// live vs. a hanging net.fetch); this one only needs a valid config + an overridable registerHook.
+function makeCtx(overrides: {
+  config?: Record<string, unknown>;
+  registerHook?: (event: string, handler: HookHandler, priority?: number) => void;
+} = {}) {
+  return {
+    config: overrides.config ?? { publicId: 'bot', apiHost: 'https://typebot.io' },
+    logger: { log() {}, debug() {}, warn() {}, error() {} },
+    storage: { get: async () => null, set: async () => {}, delete: async () => {}, list: async () => [] },
+    net: { fetch: async () => ({ ok: true, status: 200, headers: {}, body: '{}' }) },
+    conversations: { send: async () => {} },
+    registerHook: overrides.registerHook ?? (() => {}),
+  };
+}
+
+// Enables a fresh Plugin and fires one message:received from `source`, returning the synchronous
+// {continue} result. The floated handleTurn call is out of scope — never awaited here.
+async function runHook(opts: { source: string; isGroup: boolean }) {
+  let handler: HookHandler | undefined;
+  const ctx = makeCtx({ registerHook: (_e, h) => { handler = h; } });
+  await new Plugin().onEnable(ctx as never);
+  return handler!({
+    event: 'message:received',
+    source: opts.source,
+    sessionId: 's1',
+    timestamp: new Date(),
+    data: {
+      id: 'm', from: 'x@c.us', to: 'y', chatId: 'c@c.us', body: 'hi', type: 'chat',
+      timestamp: 0, fromMe: false, isGroup: opts.isGroup,
+    },
+  });
+}
+
+test('registers at the typebot responder priority', async () => {
+  let registered: { event: string; handler: HookHandler; priority?: number } | undefined;
+  const ctx = makeCtx({
+    registerHook: (event: string, handler: HookHandler, priority?: number) =>
+      void (registered = { event, handler, priority }),
+  });
+  await new Plugin().onEnable(ctx as never);
+  assert.equal(registered?.priority, 85);
+});
+
+test('claims an in-scope chat and passes an out-of-scope one on', async () => {
+  const inScopeResult = await runHook({ source: 'Engine', isGroup: false });
+  assert.equal(inScopeResult.continue, false, 'this bot owns every chat it is in scope for');
+
+  const outOfScope = await runHook({ source: 'Webhook', isGroup: false });
+  assert.equal(outOfScope.continue, true, 'not from the engine — not ours');
+});
+
+// A reconnect replay must not sweep: the rows it would prune are the ones its own late replies may
+// still continue, and whether the prune or the reply reached a row first would decide the outcome.
+test('a replayed backlog does not trigger the idle sweep', async () => {
+  let handler: HookHandler | undefined;
+  let lists = 0;
+  const ctx = makeCtx({ registerHook: (_e, h) => { handler = h; } });
+  ctx.storage.list = async () => { lists++; return []; };
+  await new Plugin().onEnable(ctx as never);
+  const fire = (timestamp: number) => handler!({
+    event: 'message:received', source: 'Engine', sessionId: 's1', timestamp: new Date(),
+    data: { id: 'm', from: 'x@c.us', to: 'y', chatId: 'c@c.us', body: 'hi', type: 'chat', timestamp, fromMe: false, isGroup: false },
+  });
+  await fire(Math.floor(Date.now() / 1000) - 3600);
+  assert.equal(lists, 0, 'a message written an hour ago does not sweep');
+  await fire(Math.floor(Date.now() / 1000));
+  assert.ok(lists > 0, 'the next live message does');
+});
+
+test('an invalid per-session config logs a warning and passes the message on, and healthCheck tracks live config', async () => {
+  let handler!: HookHandler;
+  let live: Record<string, unknown> = { publicId: 'bot', apiHost: 'https://typebot.io' };
+  const warnings: string[] = [];
+  const plugin = new Plugin();
+  assert.equal((await plugin.healthCheck()).healthy, false);
+  await plugin.onEnable({
+    get config() { return live; },
+    logger: { log() {}, debug() {}, warn: (m: string) => warnings.push(m), error() {} },
+    storage: { get: async () => null, set: async () => {}, delete: async () => {}, list: async () => [] },
+    net: { fetch: async () => ({ ok: true, status: 200, headers: {}, body: '{}' }) },
+    conversations: { send: async () => {} },
+    registerHook: (_e: string, h: HookHandler) => { handler = h; },
+  } as unknown as PluginContext);
+  assert.equal((await plugin.healthCheck()).healthy, true);
+
+  for (const type of ['call', 'masked']) {
+    const res = await handler({
+      event: 'message:received',
+      source: 'Engine',
+      sessionId: 's1',
+      timestamp: new Date(),
+      data: { id: `m-${type}`, from: 'x@c.us', to: 'y', chatId: 'c@c.us', body: '', type, timestamp: 0, fromMe: false, isGroup: false },
+    });
+    assert.deepEqual(res, { continue: true });
+  }
+
+  live = { publicId: 'bot', apiHost: 'http://insecure.example.com' };
+  assert.equal((await plugin.healthCheck()).healthy, false);
+  const badRes = await handler({
+    event: 'message:received',
+    source: 'Engine',
+    sessionId: 's1',
+    timestamp: new Date(),
+    data: { id: 'm-bad', from: 'x@c.us', to: 'y', chatId: 'c@c.us', body: 'hi', type: 'chat', timestamp: 0, fromMe: false, isGroup: false },
+  });
+  assert.deepEqual(badRes, { continue: true });
+  assert.ok(warnings.some(w => /config invalid/.test(w)));
+});
+
+test('orphan sweep runs once per interval globally instead of once per active WhatsApp session', async () => {
+  let handler!: HookHandler;
+  const listPrefixes: Array<string | undefined> = [];
+  const ctx = makeCtx({ registerHook: (_e, h) => { handler = h; } });
+  ctx.storage.list = async (prefix?: string) => {
+    listPrefixes.push(prefix);
+    return [];
+  };
+  await new Plugin().onEnable(ctx as never);
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  for (const sid of ['s1', 's2', 's3', 's4']) {
+    await handler({
+      event: 'message:received',
+      source: 'Engine',
+      sessionId: sid,
+      timestamp: new Date(),
+      data: { id: `m-${sid}`, from: 'x@c.us', to: 'y', chatId: 'c@c.us', body: 'hi', type: 'chat', timestamp: nowSec, fromMe: false, isGroup: false },
+    });
+  }
+  await new Promise(r => setImmediate(r));
+  const unscopedOrphanScans = listPrefixes.filter(p => p === 'sess:').length;
+  assert.equal(unscopedOrphanScans, 1, `expected 1 global orphan scan across 4 sessions, got ${unscopedOrphanScans}`);
+  assert.equal(listPrefixes.filter(p => p?.startsWith('sess:s')).length, 4, 'each session still runs its own scoped idle sweep');
+});

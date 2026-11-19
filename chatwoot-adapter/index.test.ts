@@ -1,0 +1,428 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import ChatwootAdapter from './index.ts';
+import { MappingStore, destinationIdentity } from './mapping-store.ts';
+import { MAX_PENDING_RETRIES, RETRY_INTERVAL_MS } from './retry.ts';
+import type { PluginContext, WebhookHandler } from '../types/zaajil';
+
+function fakeCtx(config: Record<string, unknown>) {
+  const hooks: string[] = [];
+  const routes: string[] = [];
+  const cbs: Record<string, (h: unknown) => Promise<{ continue: boolean }>> = {};
+  const priorities: Record<string, number | undefined> = {};
+  let fetches = 0;
+  const storageMap = new Map<string, unknown>();
+  const ctx = {
+    config,
+    storage: {
+      get: async (k: string) => (storageMap.has(k) ? storageMap.get(k) : null),
+      set: async (k: string, v: unknown) => void storageMap.set(k, v),
+      delete: async (k: string) => void storageMap.delete(k),
+      list: async () => [...storageMap.keys()],
+    },
+    mappings: { upsert: async () => {}, get: async () => null, getByProvider: async () => null },
+    net: { fetch: async () => { fetches++; return { ok: true, status: 200, headers: {}, body: '{}' }; } },
+    conversations: { send: async () => ({}) },
+    handover: { set: async () => ({}) },
+    engine: { canonicalChatId: async (_s: string, c: string) => c },
+    logger: { log: () => {}, debug: () => {}, warn: () => {}, error: () => {} },
+    registerHook: (event: string, cb: (h: unknown) => Promise<{ continue: boolean }>, priority?: number) => {
+      hooks.push(event);
+      cbs[event] = cb;
+      priorities[event] = priority;
+    },
+    registerWebhook: (route: string) => void routes.push(route),
+  } as unknown as PluginContext;
+  return { ctx, hooks, routes, cbs, fetches: () => fetches, storageMap, priorities };
+}
+
+const goodConfig = { baseUrl: 'https://chat.acme.com', apiToken: 'tok', accountId: 3, inboxId: 7 };
+
+test('onEnable registers the message:received + message:sent hooks and the chatwoot ingress route', async () => {
+  const { ctx, hooks, routes } = fakeCtx(goodConfig);
+  await new ChatwootAdapter().onEnable(ctx);
+  assert.deepEqual(hooks, ['message:received', 'message:sent']);
+  assert.deepEqual(routes, ['chatwoot']);
+});
+
+// Observer band (PLUGIN-STANDARD.md "Co-installation"): must run before any responder, or a claiming
+// responder (chat-flow, group-translate) silently ends the chain before the relay ever sees the message.
+test('relays at observer priority on both hooks', async () => {
+  const { ctx, priorities } = fakeCtx(goodConfig);
+  await new ChatwootAdapter().onEnable(ctx);
+  assert.deepEqual(priorities, { 'message:received': 20, 'message:sent': 20 });
+});
+
+test('message:sent is registered even when relayOwnMessages=false (gate is per-event, not at enable)', async () => {
+  const { ctx, hooks } = fakeCtx({ ...goodConfig, relayOwnMessages: false });
+  await new ChatwootAdapter().onEnable(ctx);
+  assert.ok(hooks.includes('message:sent'));
+});
+
+test('relayOwnMessages=false gates the message:sent handler off (no Chatwoot API call)', async () => {
+  const { ctx, cbs, fetches } = fakeCtx({ ...goodConfig, relayOwnMessages: false });
+  await new ChatwootAdapter().onEnable(ctx);
+  const r = await cbs['message:sent']({
+    sessionId: 'sess',
+    source: 'Engine',
+    data: { id: 'x', fromMe: true, chatId: 'c@wa', body: 'hi', type: 'chat', isGroup: false },
+  });
+  await new Promise(res => setImmediate(res)); // let any detached work settle (there should be none)
+  assert.deepEqual(r, { continue: true });
+  assert.equal(fetches(), 0);
+});
+
+test('onEnable rejects a baseUrl carrying a path (the address-bar copy-paste)', async () => {
+  // `base()` appends /api/v1/accounts/<id> to this value, so a URL copied out of the Chatwoot dashboard
+  // produces .../app/accounts/2/settings/inboxes/8/api/v1/... and 404s every single request — while enable
+  // succeeds and healthCheck stays green until the retries burn out.
+  for (const bad of [
+    'https://chat.acme.com/app',
+    'https://chat.acme.com/app/accounts/2/settings/inboxes/8',
+    'https://chat.acme.com?foo=1',
+    'https://chat.acme.com#inbox',
+  ]) {
+    const { ctx } = fakeCtx({ ...goodConfig, baseUrl: bad });
+    await assert.rejects(new ChatwootAdapter().onEnable(ctx), /baseUrl must be the Chatwoot origin/);
+  }
+  // A bare origin, with or without the trailing slash `base()` already strips, stays valid.
+  for (const ok of ['https://chat.acme.com', 'https://chat.acme.com/', 'https://chat.acme.com:8443']) {
+    const { ctx } = fakeCtx({ ...goodConfig, baseUrl: ok });
+    await new ChatwootAdapter().onEnable(ctx);
+  }
+});
+
+test('healthCheck surfaces the last relay error, so the cause is visible without server logs', async () => {
+  // The whole point of #63: the error exists and is logged, but the log only reaches container stdout.
+  // The dashboard shows healthCheck's message, so the reason has to ride along with the counters.
+  const { ctx, cbs } = fakeCtx(goodConfig);
+  const adapter = new ChatwootAdapter();
+  await adapter.onEnable(ctx);
+  await cbs['message:received']({
+    sessionId: 'sess',
+    source: 'Engine',
+    data: { id: 'm1', fromMe: false, chatId: '628123@c.us', body: 'hi', type: 'chat', isGroup: false },
+  });
+  // The hook fires the relay off-thread so a slow Chatwoot never blocks the WA pipeline — let it settle.
+  for (let i = 0; i < 10; i++) await new Promise(res => setImmediate(res));
+  const h = await adapter.healthCheck();
+  assert.match(h.message ?? '', /last error: /);
+  await adapter.onDisable();
+});
+
+test('healthCheck reports the pending retry backlog (healthy — pending is transient)', async () => {
+  const { ctx, storageMap } = fakeCtx(goodConfig);
+  storageMap.set('retry:sess:m1', { sessionId: 'sess', chatId: 'c@wa', msg: { id: 'm1' }, attempts: 1, enqueuedAt: 1 });
+  const adapter = new ChatwootAdapter();
+  await adapter.onEnable(ctx);
+  const h = await adapter.healthCheck();
+  assert.equal(h.healthy, true);
+  assert.match(h.message ?? '', /1 inbound message\(s\) pending retry/);
+  await adapter.onDisable();
+});
+
+test('healthCheck is UNHEALTHY when the retry queue is saturated (at capacity → dropping oldest)', async () => {
+  const { ctx, storageMap } = fakeCtx(goodConfig);
+  for (let i = 0; i < MAX_PENDING_RETRIES; i++) {
+    storageMap.set(`retry:sess:m${i}`, { sessionId: 'sess', chatId: 'c', msg: { id: `m${i}` }, attempts: 1, enqueuedAt: i });
+  }
+  const adapter = new ChatwootAdapter();
+  await adapter.onEnable(ctx);
+  const h = await adapter.healthCheck();
+  assert.equal(h.healthy, false); // active data loss must not read as healthy
+  assert.match(h.message ?? '', /queue full, dropping oldest/);
+  await adapter.onDisable();
+});
+
+test('healthCheck is healthy with an empty queue; onDisable/onUnload run cleanly (timer cleared)', async () => {
+  const { ctx } = fakeCtx(goodConfig);
+  const adapter = new ChatwootAdapter();
+  await adapter.onEnable(ctx);
+  assert.deepEqual(await adapter.healthCheck(), { healthy: true, message: undefined });
+  await adapter.onDisable();
+  await adapter.onUnload();
+});
+
+// The retry-drain timer re-relays a queued message via the SAME relayInbound a live inbound uses, but a
+// dangling mapping's 404 must NOT trigger the unlink-and-rebuild recovery there: the drain is already a
+// re-attempt of a previously failed relay, so rebuilding would mint a fresh orphan Chatwoot conversation on
+// every one of its (up to 5) attempts instead of ever converging. That's what relayInbound's `recoverOn404`
+// option exists to prevent — this pins that the drain call site actually passes it false.
+test('retry drain leaves a dangling mapping alone on a 404 — no rebuild, the retry budget absorbs it', async (t) => {
+  // relayOwnMessages off so the message:sent dispatch below captures this session's resolved config
+  // without relaying anything: the drain re-posts only for sessions the plugin has actually seen an
+  // event for, because that dispatch is the only place a per-session config resolves.
+  const { ctx, storageMap, cbs } = fakeCtx({ ...goodConfig, relayOwnMessages: false });
+  // A stale mapping: Chatwoot conversation 55 is gone (operator deleted it out of band) but the mapping
+  // still points at it.
+  storageMap.set(`${destinationIdentity(goodConfig)}:conv:sess:c@wa`, { conversationId: 55, contactId: 9, sourceId: 'src' });
+  // Queued as if an earlier live relay against it already failed once.
+  storageMap.set('retry:sess:m1', {
+    destination: destinationIdentity(goodConfig),
+    sessionId: 'sess',
+    chatId: 'c@wa',
+    msg: { id: 'm1', from: 'x', to: 'y', chatId: 'c@wa', body: 'hi', type: 'chat', timestamp: 0, fromMe: false, isGroup: false },
+    attempts: 0,
+    enqueuedAt: 1,
+  });
+  // A minimal Chatwoot double: the stale conversation 404s; a contact search + fresh conversation create
+  // would succeed if the recovery path ran (it must not).
+  const calls: string[] = [];
+  ctx.net.fetch = (async (url: string, init?: { method?: string }) => {
+    const method = init?.method ?? 'GET';
+    calls.push(`${method} ${url}`);
+    if (url.includes('/contacts/search')) {
+      return {
+        ok: true, status: 200, headers: {},
+        body: JSON.stringify({ payload: [{ id: 9, identifier: 'c@wa', contact_inboxes: [{ inbox: { id: 7 }, source_id: 'src' }] }] }),
+      };
+    }
+    if (/\/contacts\/\d+\/conversations$/.test(url)) return { ok: true, status: 200, headers: {}, body: JSON.stringify({ payload: [] }) };
+    if (method === 'POST' && url.endsWith('/conversations')) return { ok: true, status: 200, headers: {}, body: JSON.stringify({ id: 200 }) };
+    if (method === 'POST' && url.endsWith('/conversations/55/messages')) return { ok: false, status: 404, headers: {}, body: 'Not Found' };
+    return { ok: true, status: 200, headers: {}, body: '{}' };
+  }) as typeof ctx.net.fetch;
+
+  // Fake the retry timer so the drain runs synchronously under test control instead of after a real 30s wait.
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const adapter = new ChatwootAdapter();
+  await adapter.onEnable(ctx);
+  // One event for this session, so its config is resolved and captured the way production does.
+  await cbs['message:sent']({
+    source: 'Engine', sessionId: 'sess', timestamp: new Date(),
+    data: { id: 'seen', from: 'me', to: 'x', chatId: 'other@wa', body: 'x', type: 'chat', timestamp: 0, fromMe: true, isGroup: false },
+  });
+  t.mock.timers.tick(RETRY_INTERVAL_MS);
+  // The drain's own work (storage + the fetch double above) all settles on real promises; flush them.
+  await new Promise(res => setImmediate(res));
+  await new Promise(res => setImmediate(res));
+
+  const mapping = storageMap.get(`${destinationIdentity(goodConfig)}:conv:sess:c@wa`) as { conversationId: number } | undefined;
+  assert.equal(mapping?.conversationId, 55, 'the dangling mapping must be left exactly as it was — no rebuild');
+  assert.ok(!calls.some(c => c.startsWith('POST') && c.endsWith('/conversations')), 'no fresh conversation is minted on the drain path');
+  const retry = storageMap.get('retry:sess:m1') as { attempts: number } | undefined;
+  assert.ok(retry, 'the queued message is kept for the next drain, not treated as delivered');
+  assert.equal(retry?.attempts, 1, 'the failed attempt bumps the retry counter — the budget absorbs the 404, nothing else does');
+
+  await adapter.onDisable();
+});
+
+test('the retry drain never re-posts one session\'s message with another session\'s Chatwoot account', async (t) => {
+  // ctx.config resolves the firing session's slice only inside a hook or webhook dispatch; on the retry
+  // timer it falls back to the base slice, and no capability resolves another session's config. The
+  // drain used to re-post every queued entry with that base slice, so on the multi-tenant shape this
+  // plugin advertises, tenant B's customer message went to tenant A's helpdesk with tenant A's token,
+  // and for a chat with no mapping yet it minted the conversation there and stored the mapping for good.
+  const { ctx, storageMap, cbs } = fakeCtx({ ...goodConfig, relayOwnMessages: false });
+  // Queued for a session this worker has never dispatched an event for.
+  storageMap.set('retry:tenantB:m1', {
+    destination: destinationIdentity(goodConfig),
+    sessionId: 'tenantB',
+    chatId: 'c@wa',
+    msg: { id: 'm1', from: 'x', to: 'y', chatId: 'c@wa', body: 'hi', type: 'chat', timestamp: 0, fromMe: false, isGroup: false },
+    attempts: 0,
+    enqueuedAt: 1,
+  });
+  const calls: string[] = [];
+  ctx.net.fetch = (async (url: string, init?: { method?: string }) => {
+    calls.push(`${init?.method ?? 'GET'} ${url}`);
+    return { ok: true, status: 200, headers: {}, body: '{}' };
+  }) as typeof ctx.net.fetch;
+
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const adapter = new ChatwootAdapter();
+  await adapter.onEnable(ctx);
+  t.mock.timers.tick(RETRY_INTERVAL_MS);
+  await new Promise(res => setImmediate(res));
+  await new Promise(res => setImmediate(res));
+
+  assert.deepEqual(calls, [], 'nothing may be posted for a session whose own config cannot be resolved');
+  const held = storageMap.get('retry:tenantB:m1') as { attempts: number } | undefined;
+  assert.ok(held, 'the entry is kept, not delivered and not dropped');
+  assert.equal(held?.attempts, 0, 'and not counted as a failed attempt: a retry could never have fixed this');
+
+  // Once that session dispatches an event, its slice is captured and the entry drains normally.
+  await cbs['message:sent']({
+    source: 'Engine', sessionId: 'tenantB', timestamp: new Date(),
+    data: { id: 'seen', from: 'me', to: 'x', chatId: 'other@wa', body: 'x', type: 'chat', timestamp: 0, fromMe: true, isGroup: false },
+  });
+  t.mock.timers.tick(RETRY_INTERVAL_MS);
+  await new Promise(res => setImmediate(res));
+  await new Promise(res => setImmediate(res));
+  assert.ok(calls.length > 0, 'a known session drains as before');
+
+  await adapter.onDisable();
+});
+
+test('onEnable throws on missing / invalid config', async () => {
+  const { ctx } = fakeCtx({ baseUrl: 'https://x' }); // missing apiToken, accountId, inboxId
+  await assert.rejects(new ChatwootAdapter().onEnable(ctx), /missing\/invalid config/);
+});
+
+test('onEnable rejects a non-https or credentialed baseUrl (fail fast, not per-message)', async () => {
+  // The host net allowlist only admits an https, credential-free host, so these would otherwise enable
+  // "healthy" and then silently fail every inbound relay.
+  await assert.rejects(new ChatwootAdapter().onEnable(fakeCtx({ ...goodConfig, baseUrl: 'http://chat.acme.com' }).ctx), /https/);
+  await assert.rejects(new ChatwootAdapter().onEnable(fakeCtx({ ...goodConfig, baseUrl: 'https://user:pw@chat.acme.com' }).ctx), /credential/);
+  await assert.rejects(new ChatwootAdapter().onEnable(fakeCtx({ ...goodConfig, baseUrl: 'not a url' }).ctx), /valid URL/);
+});
+
+test('healthCheck reports chats whose history import gave up', async () => {
+  const plugin = new ChatwootAdapter();
+  await plugin.onEnable(fakeCtx(goodConfig).ctx);
+  // Driving this through the real path needs a hook registration plus three consecutive failing
+  // backfills, which inbound.test.ts already covers; this cast pins only the healthCheck wiring.
+  (plugin as unknown as { onBackfillExhausted: (c: string) => void }).onBackfillExhausted('c@c.us');
+  const health = await plugin.healthCheck();
+  assert.match(health.message ?? '', /1 chat\(s\) gave up on history import/);
+  // A gave-up history import doesn't touch the live relay, so it must not flip the health verdict.
+  assert.equal(health.healthy, true);
+});
+
+test('an invalid per-session config in message:received or message:sent warns and returns {continue:true} without throwing', async () => {
+  let live: Record<string, unknown> = { ...goodConfig };
+  const warnings: string[] = [];
+  const { ctx, cbs } = fakeCtx(goodConfig);
+  Object.defineProperty(ctx, 'config', { get: () => live });
+  ctx.logger.warn = (m: string) => warnings.push(m);
+  const plugin = new ChatwootAdapter();
+  await plugin.onEnable(ctx);
+
+  live = { ...goodConfig, baseUrl: 'http://insecure.example.com' };
+  const r1 = await cbs['message:received']({
+    sessionId: 'sess',
+    source: 'Engine',
+    data: { id: 'm1', fromMe: false, chatId: '628123@c.us', body: 'hi', type: 'chat', isGroup: false },
+  });
+  const r2 = await cbs['message:sent']({
+    sessionId: 'sess',
+    source: 'Engine',
+    data: { id: 'm2', fromMe: true, chatId: '628123@c.us', body: 'hi', type: 'chat', isGroup: false },
+  });
+  assert.deepEqual(r1, { continue: true });
+  assert.deepEqual(r2, { continue: true });
+  assert.equal(warnings.length, 2);
+  await plugin.onDisable();
+});
+
+test('wildcard sessionId="*" on chatwoot ingress routes outbound reply without polluting sessionConfigs', async () => {
+  let webhookCb: WebhookHandler | undefined;
+  const sent: unknown[] = [];
+  const { ctx } = fakeCtx(goodConfig);
+  ctx.registerWebhook = (_route, cb) => {
+    webhookCb = cb;
+  };
+  ctx.conversations.send = async (env) => {
+    sent.push(env);
+    return { messageId: 'WA_1', timestamp: 0 };
+  };
+  const plugin = new ChatwootAdapter();
+  await plugin.onEnable(ctx);
+
+  await new MappingStore(ctx.storage, ctx.mappings)
+    .forDestination(goodConfig)
+    .link('sess', '628123@c.us', 'sess', { conversationId: 55, contactId: 1, sourceId: 'src' });
+
+  const rawBody = JSON.stringify({
+    event: 'message_created',
+    message_type: 'outgoing',
+    private: false,
+    id: 91,
+    content: 'hello from wildcard',
+    account: { id: 3 },
+    inbox: { id: 7 },
+    conversation: { id: 55 },
+  });
+  const res = await webhookCb!({
+    instanceId: 'inst',
+    method: 'POST',
+    sessionId: '*',
+    body: rawBody,
+    rawBody,
+    verified: true,
+    deliveryId: 'd1',
+    headers: {},
+    query: {},
+  });
+  assert.deepEqual(res, { status: 200 });
+  assert.deepEqual(sent, [{ sessionId: 'sess', chatId: '628123@c.us', type: 'text', text: 'hello from wildcard' }]);
+  const sessionConfigs = (plugin as unknown as { sessionConfigs: Map<string, unknown> }).sessionConfigs;
+  assert.equal(sessionConfigs.has('*'), false, 'must not store wildcard literal in sessionConfigs');
+  await plugin.onDisable();
+});
+
+// A Chatwoot double for the 404 recovery: conversation 55 is gone, the contact still exists, and a
+// replacement conversation (200) can be created.
+function rebuildingChatwoot(calls: string[]) {
+  return (async (url: string, init?: { method?: string }) => {
+    const method = init?.method ?? 'GET';
+    calls.push(`${method} ${url}`);
+    if (url.includes('/contacts/search')) {
+      return {
+        ok: true, status: 200, headers: {},
+        body: JSON.stringify({ payload: [{ id: 9, identifier: 'c@wa', contact_inboxes: [{ inbox: { id: 7 }, source_id: 'src' }] }] }),
+      };
+    }
+    if (/\/contacts\/\d+\/conversations$/.test(url)) return { ok: true, status: 200, headers: {}, body: JSON.stringify({ payload: [] }) };
+    if (method === 'POST' && url.endsWith('/conversations')) return { ok: true, status: 200, headers: {}, body: JSON.stringify({ id: 200 }) };
+    if (method === 'POST' && url.endsWith('/conversations/55/messages')) return { ok: false, status: 404, headers: {}, body: 'Not Found' };
+    return { ok: true, status: 200, headers: {}, body: JSON.stringify({ id: 1 }) };
+  }) as PluginContext['net']['fetch'];
+}
+
+const inboundHook = {
+  source: 'Engine', sessionId: 'sess', timestamp: new Date(),
+  data: { id: 'live1', from: 'c@wa', to: 'y', chatId: 'c@wa', body: 'hi', type: 'chat', timestamp: 0, fromMe: false, isGroup: false },
+};
+
+// The relay is fired off the hook, so wait for it on the event loop instead of on a timer.
+async function settle(done: () => boolean): Promise<void> {
+  for (let i = 0; i < 200 && !done(); i++) await new Promise(res => setImmediate(res));
+}
+
+test('a live inbound that rebuilds a deleted conversation hands the chat back to the bots', async () => {
+  const { ctx, storageMap, cbs } = fakeCtx(goodConfig);
+  storageMap.set(`${destinationIdentity(goodConfig)}:conv:sess:c@wa`, { conversationId: 55, contactId: 9, sourceId: 'src', handoverState: 'human' });
+  const calls: string[] = [];
+  ctx.net.fetch = rebuildingChatwoot(calls);
+  const handovers: unknown[] = [];
+  ctx.handover.set = (async (key: unknown, state: unknown) => void handovers.push([key, state])) as typeof ctx.handover.set;
+
+  const adapter = new ChatwootAdapter();
+  await adapter.onEnable(ctx);
+  await cbs['message:received'](inboundHook);
+  await settle(() => calls.some(c => c.endsWith('/conversations/200/messages')));
+
+  assert.ok(calls.some(c => c.endsWith('/conversations/200/messages')), 'the message lands in the replacement conversation');
+  assert.deepEqual(handovers, [[{ sessionId: 'sess', chatId: 'c@wa', instanceId: 'sess' }, 'bot']]);
+  await adapter.onDisable();
+});
+
+test('a rebuild that outlives a destination change does not touch handover', async () => {
+  const { ctx, storageMap, cbs } = fakeCtx({ ...goodConfig, relayOwnMessages: false });
+  storageMap.set(`${destinationIdentity(goodConfig)}:conv:sess:c@wa`, { conversationId: 55, contactId: 9, sourceId: 'src', handoverState: 'human' });
+  const calls: string[] = [];
+  ctx.net.fetch = rebuildingChatwoot(calls);
+  const handovers: unknown[] = [];
+  ctx.handover.set = (async (key: unknown, state: unknown) => void handovers.push([key, state])) as typeof ctx.handover.set;
+  // The host row already points at the replacement, so the store has no reason to re-check the
+  // destination before the reset; the session's config moves to another inbox while the link is written.
+  let linked = false;
+  ctx.mappings.get = (async () =>
+    linked ? { providerConversationId: `${destinationIdentity(goodConfig)}:200`, handoverState: 'human' } : null) as typeof ctx.mappings.get;
+  ctx.mappings.upsert = (async (_key: unknown, providerConversationId: string) => {
+    if (!providerConversationId.endsWith(':200')) return;
+    linked = true;
+    (ctx as { config: unknown }).config = { ...goodConfig, inboxId: 8, relayOwnMessages: false };
+    await cbs['message:sent']({ ...inboundHook, data: { ...inboundHook.data, id: 'own1', fromMe: true } });
+  }) as typeof ctx.mappings.upsert;
+
+  const adapter = new ChatwootAdapter();
+  await adapter.onEnable(ctx);
+  await cbs['message:received'](inboundHook);
+  await settle(() => [...storageMap.keys()].some(k => k.startsWith('retry:')));
+
+  assert.ok(linked, 'the rebuild reached the link');
+  assert.deepEqual(handovers, []);
+  await adapter.onDisable();
+});

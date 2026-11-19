@@ -1,0 +1,318 @@
+import type {
+  WebhookRequest,
+  PluginConversationsCapability,
+  PluginHandoverCapability,
+  PluginMappingsCapability,
+  PluginEngineReadCapability,
+  HandoverState,
+} from '../types/zaajil';
+import type { MappingStore } from './mapping-store.ts';
+import type { KeyedAsyncLock } from './chat-lock.ts';
+import { historyScope } from './relay.ts';
+import { shouldRelayOutbound, type ChatwootWebhookMessage } from './filters.ts';
+
+export interface OutboundDeps {
+  lock: KeyedAsyncLock;
+  conversations: PluginConversationsCapability;
+  handover: PluginHandoverCapability;
+  mappings?: PluginMappingsCapability;
+  // Resolves @lid -> @c.us so the per-chat lock key matches handleSent's for a migrated contact (the echo
+  // marker + own-send handler must serialize on one canonical key).
+  engine: PluginEngineReadCapability;
+  store: MappingStore;
+  accountId?: number;
+  inboxId: number;
+  log: (m: string, e?: unknown) => void;
+}
+
+// Chatwoot → WhatsApp. `conversation_updated` drives handover; a relayable `message_created` is sent to
+// WhatsApp under the per-chat lock (deduped on the Chatwoot message id).
+//
+// The returned status is NOT what the provider sees: the host computes that from
+// `manifest.ingress[].response.ack` and reads only whether this handler resolved or threw
+// (types/zaajil.d.ts:296). What the number does control is retry — resolving means "accepted, do not
+// retry", throwing means "retry". The values below are kept because they read as intent at each exit,
+// not because a 400 reaches Chatwoot.
+export async function handleOutbound(deps: OutboundDeps, req: WebhookRequest): Promise<{ status: number }> {
+  let evt: ChatwootWebhookMessage;
+  try {
+    evt = JSON.parse(req.rawBody) as ChatwootWebhookMessage;
+  } catch {
+    return { status: 400 };
+  }
+  if (!evt || typeof evt !== 'object' || Array.isArray(evt)) return { status: 400 };
+  const accounts = [evt.account?.id, evt.account_id, evt.conversation?.account_id];
+  const inboxes = [evt.inbox?.id, evt.inbox_id, evt.conversation?.inbox_id];
+  if ((deps.accountId !== undefined && accounts.some(id => id !== undefined && id !== deps.accountId)) ||
+      inboxes.some(id => id !== undefined && id !== deps.inboxId)) return { status: 200 };
+  // The delivery's WA session scope. Present → the reverse lookup + dedup are tenant-scoped (isolating two
+  // Chatwoot accounts that share a conversation id); absent → unscoped, same as a single-tenant install.
+  const sessionId = req.sessionId && req.sessionId !== '*' ? req.sessionId : undefined;
+  try {
+    if (evt.event === 'conversation_updated' || evt.event === 'conversation_status_changed') {
+      await applyHandover(deps, sessionId, evt);
+      return { status: 200 };
+    }
+    if (evt.event === 'message_created' && shouldRelayOutbound(evt, deps.inboxId)) await relay(deps, sessionId, evt);
+  } catch (err) {
+    deps.log('outbound failed', err);
+    throw err;
+  }
+  return { status: 200 };
+}
+
+async function resolveTarget(deps: OutboundDeps, conversationId: number, sessionId?: string) {
+  const target = await deps.store.getByConversation(conversationId, sessionId);
+  if (!target && deps.store.destination && await deps.store.hasLegacyConversation(conversationId, sessionId)) {
+    throw new Error('Chatwoot mapping must be established in the current destination before this event can be delivered');
+  }
+  return target;
+}
+
+async function relay(deps: OutboundDeps, sessionId: string | undefined, evt: ChatwootWebhookMessage): Promise<void> {
+  const conversationId = evt.conversation?.id;
+  const text = evt.content;
+  const media = mediaAttachments(evt);
+  // A media-only agent reply (voice note, image, …) has no `content`, so gate on either text or media —
+  // the old text-only guard dropped every attachment silently (#607).
+  if (typeof conversationId !== 'number' || !Number.isSafeInteger(conversationId) || conversationId <= 0 || (!text && media.length === 0)) return;
+  const target = await resolveTarget(deps, conversationId, sessionId);
+  if (!target) {
+    deps.log(`no WA mapping for conversation ${conversationId}`);
+    return;
+  }
+  const lockKey = await deps.engine.canonicalChatId(target.sessionId, target.chatId);
+  await deps.lock.run(`${target.sessionId}:${lockKey}`, async () => {
+    // Same conversation-scoped key relayMessage holds across post+mark: an echo webhook that arrives
+    // while the adapter's own post is still in flight waits here until the echo marker has landed.
+    await deps.lock.run(`${target.sessionId}:conv:${conversationId}`, async () => {
+    if (deps.store.destination) {
+      const link = await deps.store.getByChat(target.sessionId, target.chatId);
+      if (!link) throw new Error('Chatwoot mapping is incomplete in the current destination');
+      if (link.conversationId !== conversationId) return;
+    }
+    const id = evt.id !== undefined ? String(evt.id) : undefined;
+    // Dedup, but mark only AFTER a successful send: a transient send failure must retry the reply, not be
+    // silently suppressed as "already seen".
+    //
+    // Scoped by target.sessionId — the WA session that owns this conversation, just resolved from the
+    // mapping — NOT the delivery's `sessionId`. Both identify the tenant, but the delivery
+    // scope is `instance.sessionScope ?? undefined` and so is UNDEFINED for an unscoped instance, which
+    // would put its markers in a global namespace keyed by bare Chatwoot message id: two tenants whose
+    // ids collide could then suppress each other's replies. target.sessionId is always defined, and is
+    // the same value relayMessage marks the own-send mirror under, so both halves of the echo guard
+    // agree by construction.
+    //
+    // A pre-0.5.4 unscoped install has legacy `seen:cw:<id>` markers that this no longer reads. They are
+    // deliberately abandoned rather than migrated: these markers are a short-lived (3-day TTL) cache, not
+    // a ledger, duplicate deliveries are already dropped upstream by the ingress layer's providerDeliveryId
+    // dedup, and honouring them would carry the cross-tenant collision forward. Worst case is one repeated
+    // reply if Chatwoot re-announces an already-relayed message under a NEW delivery id during the upgrade
+    // window — visible and self-correcting, unlike silently dropping a genuine agent reply.
+    if (id && (await deps.store.hasSeen('cw', id, target.sessionId))) return;
+    // Echo guard for the own-send relay (#615): every message this reply sends comes back as a fromMe
+    // message:sent event, and handleSent skips it only if its WA id was marked. Claimed as each send
+    // RETURNS, not after the whole reply: a multi-attachment reply that throws part-way leaves the
+    // sends that did land already guarded, so the retry costs the contact a duplicate (this module's
+    // documented duplicate-over-loss posture) without ALSO mirroring those first copies back into
+    // Chatwoot. Scoped by target.sessionId, the WA session that will emit them, never the delivery
+    // scope; relayMessage marks the own-send mirror under the same value, so both halves agree.
+    // Inside the conversation lock, so a mark always lands before message:sent can take that lock.
+    let unclaimed = 0;
+    const claimEcho = async (res: unknown): Promise<void> => {
+      const sentId = (res as { messageId?: string } | null)?.messageId;
+      if (sentId) {
+        await deps.store.markSeen('wa', sentId, target.sessionId);
+        await deps.store.markSeen('wa', sentId, historyScope(target.sessionId, conversationId));
+      } else unclaimed++;
+    };
+    if (media.length > 0) {
+      // No replyTo on a media envelope: the engine media path cannot quote, and the host REJECTS an
+      // envelope carrying both — which would dead-letter the whole reply for a quote decoration. A
+      // quoted attachment therefore goes out unquoted, with its caption intact.
+      //
+      // Sequential, inside the conversation lock already held: each is a separate WhatsApp message and
+      // the agent's order is the order they should arrive in. The caption rides the FIRST only, so a
+      // three-image reply does not repeat the agent's text three times. A failure part-way propagates
+      // before the 'cw' marker is written, so the whole reply retries; that is the module's documented
+      // duplicate-over-loss posture (see the marker note above), not an oversight.
+      for (const [index, part] of media.entries()) {
+        await claimEcho(
+          await deps.conversations.send({
+            sessionId: target.sessionId,
+            chatId: target.chatId,
+            type: part.type,
+            mediaUrl: part.url,
+            text: index === 0 ? text || undefined : undefined,
+          }),
+        );
+      }
+    } else {
+      const env = { sessionId: target.sessionId, chatId: target.chatId, type: 'text' as const, text };
+      // An agent "Reply to" carries the quoted message's source_id — a WA message id for everything this
+      // adapter posts — and the engine renders it as a real WhatsApp quote. Best-effort: the target can
+      // sit outside the engine's retained window (whatsapp-web.js keeps ~100 messages per chat, Baileys
+      // 5000 overall) and the engine then throws, so a refused quote retries unquoted rather than burning
+      // the retry budget into the dead-letter queue. The re-send matches how a failed send is already
+      // handled here — mark-after-success, so a duplicate is possible but a lost agent reply is not.
+      const replyTo = evt.content_attributes?.in_reply_to_external_id;
+      await claimEcho(
+        replyTo
+          ? await deps.conversations.send({ ...env, replyTo }).catch(err => {
+              // Capability rejections cross the worker bridge only as error message text
+              // (WorkerCapabilityClient); retry unquoted only when the quote itself failed pre-send.
+              const msg = err instanceof Error ? err.message : String(err);
+              if (!/not found|replyTo is not supported/i.test(msg)) throw err;
+              deps.log('quote target unresolvable; sending the reply unquoted', err);
+              return deps.conversations.send(env);
+            })
+          : await deps.conversations.send(env),
+      );
+    }
+    if (id) await deps.store.markSeen('cw', id, target.sessionId);
+    if (unclaimed > 0) {
+      // No id to key the echo guard on (an engine that returns an empty messageId — e.g. Baileys' `?? ''`).
+      // Those sends' own message:sent could be re-relayed as a duplicate; surface it rather than fail
+      // silently open.
+      deps.log(`conversation.send returned no message id for ${unclaimed} send(s); own-send echo guard skipped for those`);
+    }
+    });
+  });
+}
+
+// EVERY attachment with a downloadable URL, in order. One WhatsApp message carries one media, so an
+// agent reply holding several becomes several sends; taking only the first dropped the rest silently,
+// and the 'cw' marker written after that one send made the loss permanent on re-delivery. Chatwoot
+// models attachments as a has_many on a single message_created, so the multi shape is ordinary, not
+// exotic. The host fetches each URL by its SSRF-guarded media-by-URL path, so no bytes cross the
+// sandbox. Audio relays as a PTT voice note: the common agent action is recording voice, and a plain
+// audio file is the rare exception.
+function mediaAttachments(
+  evt: ChatwootWebhookMessage,
+): Array<{ type: 'image' | 'video' | 'voice' | 'file'; url: string }> {
+  const out: Array<{ type: 'image' | 'video' | 'voice' | 'file'; url: string }> = [];
+  for (const a of evt.attachments ?? []) {
+    if (!a?.data_url) continue;
+    const type = a.file_type === 'image' ? 'image' : a.file_type === 'video' ? 'video' : a.file_type === 'audio' ? 'voice' : 'file';
+    out.push({ type, url: a.data_url });
+  }
+  return out;
+}
+
+// Human handover is driven by the assignee_id transition, NOT by status (status:'open' is not a human
+// signal — the adapter itself opens conversations). Assignee set => human; cleared => bot.
+// A status change with no human assignee releases a chat only when its stored handover state is closed
+// (left there by 0.9.18 or earlier); bot and human states are never touched by status events.
+function isBotAssignee(assignee: unknown): boolean {
+  return (
+    assignee != null &&
+    typeof assignee === 'object' &&
+    !Array.isArray(assignee) &&
+    ((assignee as { type?: unknown }).type === 'agent_bot' ||
+      (assignee as { type?: unknown }).type === 'captain_assistant')
+  );
+}
+
+function eventConversation(
+  evt: ChatwootWebhookMessage,
+): NonNullable<ChatwootWebhookMessage['conversation']> | ChatwootWebhookMessage {
+  return evt.conversation != null && typeof evt.conversation === 'object' && !Array.isArray(evt.conversation)
+    ? evt.conversation
+    : evt;
+}
+
+// When Chatwoot committed the change an event reports, in epoch ms: the `updated_at` entry of
+// `changed_attributes`, captured with the change. The payload's own `updated_at` is read when the
+// webhook is built, which can be after a later change, so it cannot order two events.
+function committedAt(evt: ChatwootWebhookMessage): number | undefined {
+  const entry = (Array.isArray(evt.changed_attributes) ? evt.changed_attributes : []).find(
+    a => a != null && typeof a === 'object' && 'updated_at' in a,
+  )?.['updated_at'];
+  const value = entry != null && typeof entry === 'object' && !Array.isArray(entry) ? entry.current_value : undefined;
+  const at = typeof value === 'string' ? Date.parse(value) : Number.NaN;
+  return Number.isFinite(at) ? at : undefined;
+}
+
+function assigneeChange(evt: ChatwootWebhookMessage): { changed: boolean; assignee: number | undefined } {
+  // Guard each element: `changed_attributes` is untrusted parsed JSON, so a non-object entry (e.g. `null`)
+  // would make `'assignee_id' in a` throw a TypeError → an endless retry of a signed-but-malformed event.
+  const attr = (Array.isArray(evt.changed_attributes) ? evt.changed_attributes : []).find(a => a != null && typeof a === 'object' && 'assignee_id' in a)?.[
+    'assignee_id'
+  ];
+  const conversation = eventConversation(evt);
+  if (!attr || typeof attr !== 'object' || Array.isArray(attr)) return { changed: false, assignee: undefined };
+  const metaAssignee = (conversation?.meta ?? evt.meta)?.assignee;
+  const fallbackId =
+    metaAssignee != null && typeof metaAssignee === 'object' && !Array.isArray(metaAssignee) && !isBotAssignee(metaAssignee)
+      ? metaAssignee.id
+      : undefined;
+  const assignee = Object.hasOwn(attr, 'current_value') ? attr.current_value : fallbackId;
+  const valid = typeof assignee === 'number' && Number.isSafeInteger(assignee) && assignee > 0;
+  return { changed: assignee === null || valid, assignee: valid ? assignee as number : undefined };
+}
+
+function statusChanged(evt: ChatwootWebhookMessage): boolean {
+  if (evt.event === 'conversation_status_changed') return true;
+  if (!Array.isArray(evt.changed_attributes)) return false;
+  return evt.changed_attributes.some(a => {
+    if (a == null || typeof a !== 'object' || Array.isArray(a) || !('status' in a)) return false;
+    const s = a.status;
+    if (s == null || typeof s !== 'object' || Array.isArray(s)) return false;
+    return !Object.hasOwn(s, 'previous_value') || !Object.hasOwn(s, 'current_value') || s.previous_value !== s.current_value;
+  });
+}
+
+function unassigned(
+  conversation: ChatwootWebhookMessage['conversation'] | ChatwootWebhookMessage | undefined,
+  evt: ChatwootWebhookMessage,
+): boolean {
+  const meta = conversation?.meta ?? evt.meta;
+  if (meta == null || typeof meta !== 'object' || Array.isArray(meta) || !Object.hasOwn(meta, 'assignee')) return false;
+  return meta.assignee === null || isBotAssignee(meta.assignee);
+}
+
+async function applyHandover(deps: OutboundDeps, sessionId: string | undefined, evt: ChatwootWebhookMessage): Promise<void> {
+  const conversation = eventConversation(evt);
+  const conversationId = conversation?.id;
+  const inboxId = evt.inbox?.id ?? conversation?.inbox_id ?? evt.inbox_id;
+  if (typeof conversationId !== 'number' || !Number.isSafeInteger(conversationId) || conversationId <= 0 || inboxId !== deps.inboxId) return;
+  const { changed, assignee } = assigneeChange(evt);
+  const releaseParked = !changed && statusChanged(evt) && unassigned(conversation, evt);
+  if (!changed && !releaseParked) return; // never infer human from status alone
+  const target = await resolveTarget(deps, conversationId, sessionId);
+  if (!target) return;
+  const resolved: HandoverState = changed && assignee ? 'human' : 'bot';
+  // Only an assignee change is ordered. A release is decided by the stored state and the payload's own
+  // assignee, which is read when the webhook is built and so is the freshest there is.
+  const at = changed ? committedAt(evt) : undefined;
+  // instanceId in the mapping mirror = sessionId (a session-scoped instance is 1:1 with its session), so
+  // inbound's ctx.mappings.upsert and this handover.set address the SAME conversation-mapping row. Lock on
+  // the RAW chatId (not canonicalized): a handover webhook arrives independently of WA session state, and
+  // canonicalChatId requires a live engine — resolving it here would wedge a handover while the session is
+  // offline. Handover (a state-flag write) and relay (a message send) are independent, so they don't need
+  // to serialize with each other; the raw key still serializes concurrent handover events for a chat.
+  await deps.lock.run(`${target.sessionId}:${target.chatId}`, async () => {
+    const link = await deps.store.getByChat(target.sessionId, target.chatId);
+    if (deps.store.destination) {
+      if (!link) throw new Error('Chatwoot mapping is incomplete in the current destination');
+      if (link.conversationId !== conversationId) return;
+    }
+    const prevAt = link?.handoverAt;
+    if (at !== undefined && typeof prevAt === 'number' && at < prevAt) {
+      deps.log(`ignoring stale handover event for conversation ${conversationId} (${at} < ${prevAt})`);
+      return;
+    }
+    const key = { sessionId: target.sessionId, chatId: target.chatId, instanceId: target.sessionId };
+    if (releaseParked) {
+      const current = await deps.mappings?.get(key);
+      if (current?.handoverState !== 'closed') return;
+    }
+    await deps.handover.set(key, resolved);
+    // Record what this conversation now holds, and when. The state is already applied, so a failed
+    // write must not make the host retry (and so reorder) this event: it only leaves the next stale
+    // delivery unrecognized, as before 0.9.21. Limited to a link that still points at this conversation.
+    await deps.store
+      .patch(target.sessionId, target.chatId, { handoverState: resolved, ...(at !== undefined ? { handoverAt: at } : {}) }, conversationId)
+      .catch(err => deps.log('handover record write failed', err));
+  });
+}
